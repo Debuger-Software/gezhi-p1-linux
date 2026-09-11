@@ -1,0 +1,106 @@
+#!/usr/bin/env python3
+from PIL import Image
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+
+IMG_W = 380
+IMG_H = 220
+PRINTER = "GEZHI_P1"
+
+def fail(msg, code=1):
+    print(f"label-print: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+def usage():
+    print(f"Usage: {Path(sys.argv[0]).name} IMAGE")
+    print(f"       {Path(sys.argv[0]).name} --check")
+    sys.exit(0)
+
+if len(sys.argv) != 2:
+    usage()
+
+if sys.argv[1] in ("-h", "--help"):
+    usage()
+
+if sys.argv[1] == "--check":
+    r = subprocess.run(
+        ["lpstat", "-p", PRINTER],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if r.returncode == 0:
+        print(r.stdout.strip())
+        sys.exit(0)
+    fail(f"CUPS queue {PRINTER!r} not found")
+
+src_path = Path(sys.argv[1])
+
+if not src_path.is_file():
+    fail(f"file not found: {src_path}")
+
+try:
+    img = Image.open(src_path)
+except Exception as e:
+    fail(f"cannot open image: {e}")
+
+# Flatten transparency onto white.
+if img.mode in ("RGBA", "LA") or "transparency" in img.info:
+    rgba = img.convert("RGBA")
+    bg = Image.new("RGBA", rgba.size, "white")
+    bg.alpha_composite(rgba)
+    img = bg.convert("RGB")
+
+img = img.convert("L")
+
+# Keep aspect ratio and fit into the calibrated 380x220 printable area.
+# A 380x220 source image is therefore printed 1:1.
+img.thumbnail((IMG_W, IMG_H), Image.Resampling.LANCZOS)
+
+canvas = Image.new("L", (IMG_W, IMG_H), 255)
+x = (IMG_W - img.width) // 2
+y = (IMG_H - img.height) // 2
+canvas.paste(img, (x, y))
+
+# Pillow's default conversion uses Floyd-Steinberg dithering.
+canvas = canvas.convert("1")
+
+bytes_per_row = (IMG_W + 7) // 8
+pixels = canvas.load()
+data = bytearray()
+
+for y in range(IMG_H):
+    for bx in range(bytes_per_row):
+        byte = 0
+        for bit in range(8):
+            x = bx * 8 + bit
+            if x < IMG_W:
+                # GEZHI P1 bitmap polarity discovered experimentally:
+                # white pixel -> 1, black pixel -> 0
+                if pixels[x, y] != 0:
+                    byte |= 1 << (7 - bit)
+        data.append(byte)
+
+tspl = bytearray()
+tspl += b"SIZE 50 mm,30 mm\r\n"
+tspl += b"GAP 2 mm,0 mm\r\n"
+tspl += b"CLS\r\n"
+tspl += f"BITMAP 0,0,{bytes_per_row},{IMG_H},0,".encode()
+tspl += data
+tspl += b"\r\nPRINT 1,1\r\n"
+
+with tempfile.NamedTemporaryFile(suffix=".tspl", delete=False) as f:
+    f.write(tspl)
+    tspl_path = Path(f.name)
+
+try:
+    subprocess.run(
+        ["lp", "-d", PRINTER, "-o", "raw", str(tspl_path)],
+        check=True,
+    )
+finally:
+    tspl_path.unlink(missing_ok=True)
+
+print(f"Sent to {PRINTER}: {src_path.name}")
